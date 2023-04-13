@@ -35,6 +35,14 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
+    /// Starts a new instance of [PeerConnection].
+    ///
+    /// In order to exchange necessary data between initiator/acceptor peers, you need to follow
+    /// messages coming from [PeerConnection::listen] on one peer and apply them on another via
+    /// [PeerConnection::signal].
+    ///
+    /// Use [PeerConnection::connected] in order to await for connection to be established.
+    /// Use [PeerConnection::close] in order to gracefully close the connection.
     pub async fn start(initiator: bool, mut options: Options) -> Result<Self, Error> {
         // Create a MediaEngine object to configure the supported codec
         let mut media_engine = MediaEngine::default();
@@ -195,7 +203,7 @@ impl PeerConnection {
 
         if initiator {
             // Create a datachannel with label 'data'
-            for (label, config) in options.channels.drain() {
+            for (label, config) in options.labels.drain() {
                 let dc = peer_connection.create_data_channel(&label, config).await?;
                 let _ = data_channels_tx.send(DataChannel::new(dc));
             }
@@ -214,6 +222,8 @@ impl PeerConnection {
         Ok(pc)
     }
 
+    /// Check if current peer connection is in process of being negotiated with its remote
+    /// counterpart.
     pub fn is_negotiating(&self) -> bool {
         if let InnerState::Negotiating(_) = &**self.status.get() {
             true
@@ -222,14 +232,20 @@ impl PeerConnection {
         }
     }
 
+    /// Returns the reference to stream of [DataChannel]s established by the initiator for this
+    /// peer connection pair.
     pub fn data_channels(&self) -> &PeerConnectionDataChannels {
         &self.data_channels
     }
 
+    /// This method allows to await until the peer connection pair negotiation is finished.
     pub async fn connected(&self) -> Result<(), Error> {
         status_connected(&self.status).await
     }
 
+    /// Listen to the next [Signal] message coming out of the current [PeerConnection]. This signal
+    /// should be serialized, passed over to its remote counterpart and applied there using
+    /// [PeerConnection::signal].
     pub async fn listen(&self) -> Option<Signal> {
         if self.status.get().is_closed() {
             None
@@ -239,6 +255,7 @@ impl PeerConnection {
         }
     }
 
+    /// Apply [Signal]s received from the remote [PeerConnection].
     pub async fn signal(&self, signal: Signal) -> Result<(), Error> {
         match signal {
             Signal::Renegotiate => {
@@ -299,6 +316,7 @@ impl PeerConnection {
         }
     }
 
+    /// Gracefully close current [PeerConnection].
     pub async fn close(&self) -> Result<(), Error> {
         self.status.set_closed()?;
         self.pc.close().await?;
@@ -353,12 +371,12 @@ impl Negotiation {
 
 #[derive(Clone)]
 pub struct Options {
-    pub channels: HashMap<Arc<str>, Option<RTCDataChannelInit>>,
+    pub labels: HashMap<Arc<str>, Option<RTCDataChannelInit>>,
     pub rtc_config: RTCConfiguration,
 }
 
 impl Options {
-    pub fn with_channels(channels: &[&str]) -> Self {
+    pub fn with_data_channels(labels: &[&str]) -> Self {
         let rtc_config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
@@ -367,7 +385,7 @@ impl Options {
             ..Default::default()
         };
         Options {
-            channels: channels
+            labels: labels
                 .into_iter()
                 .map(|&label| (Arc::from(label), None))
                 .collect(),
@@ -378,7 +396,7 @@ impl Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options::with_channels(&[])
+        Options::with_data_channels(&[])
     }
 }
 
@@ -543,7 +561,7 @@ mod test {
 
     #[tokio::test]
     async fn connection_negotiation() -> Result<(), Error> {
-        let options = Options::with_channels(&["dc"]);
+        let options = Options::with_data_channels(&["dc"]);
         let p1 = Arc::new(PeerConnection::start(true, options.clone()).await?);
         let p2 = Arc::new(PeerConnection::start(false, options).await?);
 

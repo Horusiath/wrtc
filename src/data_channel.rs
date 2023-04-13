@@ -401,7 +401,7 @@ mod test {
 
     #[tokio::test]
     async fn basic() -> Result<(), Error> {
-        let options = Options::with_channels(&["test"]);
+        let options = Options::with_data_channels(&["test-dc"]);
         let p1 = Arc::new(PeerConnection::start(true, options.clone()).await?);
         let p2 = Arc::new(PeerConnection::start(false, options).await?);
 
@@ -417,6 +417,9 @@ mod test {
 
             dc1.ready().await?;
             dc2.ready().await?;
+
+            assert_eq!(dc1.label(), "test-dc");
+            assert_eq!(dc2.label(), "test-dc");
 
             let data: Bytes = "hello".into();
             dc1.send(data.clone()).await?;
