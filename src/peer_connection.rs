@@ -1,10 +1,10 @@
 use crate::data_channel::DataChannel;
 use crate::error::Error;
 use arc_swap::{ArcSwap, Guard};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::{Arc, Weak};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -149,7 +149,6 @@ impl PeerConnection {
             let status = status.weak_ref();
             let pc = Arc::downgrade(&peer_connection);
             peer_connection.on_signaling_state_change(Box::new(move |s| {
-
                 match s {
                     RTCSignalingState::Unspecified => {}
                     RTCSignalingState::Stable => {}
@@ -243,6 +242,26 @@ impl PeerConnection {
         status_connected(&self.status).await
     }
 
+    /// This method allows to await until the peer connection is closed without requesting to close
+    /// it.
+    pub async fn closed(&self) -> Result<(), Error> {
+        loop {
+            let s = &**self.status.get();
+            match s {
+                InnerState::Waiting(ready) => ready.notified().await,
+                InnerState::Negotiating(negotiation) => negotiation.ready.notified().await,
+                InnerState::Ready(n) => n.notified().await,
+                InnerState::Closed(err) => {
+                    return if let Some(e) = err {
+                        Err(e.clone())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
     /// Listen to the next [Signal] message coming out of the current [PeerConnection]. This signal
     /// should be serialized, passed over to its remote counterpart and applied there using
     /// [PeerConnection::signal].
@@ -258,20 +277,23 @@ impl PeerConnection {
     /// Apply [Signal]s received from the remote [PeerConnection].
     pub async fn signal(&self, signal: Signal) -> Result<(), Error> {
         match signal {
-            Signal::Renegotiate => {
-                if !self.status.get().is_closed() && self.initiator {
-                    let negotiation = Negotiation::new(Arc::downgrade(&self.pc), self.initiator);
-                    self.status.set_negotiating(negotiation)?;
-                    if let InnerState::Negotiating(n) = &**self.status.get() {
-                        match n.initiate().await {
-                            Ok(Some(offer)) => {
-                                let _ = self.signal_sender.send(Signal::Sdp(offer));
-                            }
-                            Ok(None) => {
-                                // do nothing
-                            }
-                            Err(cause) => {
-                                let _ = self.status.set_failed(cause);
+            Signal::Renegotiate(renegotiate) => {
+                if renegotiate {
+                    if !self.status.get().is_closed() && self.initiator {
+                        let negotiation =
+                            Negotiation::new(Arc::downgrade(&self.pc), self.initiator);
+                        self.status.set_negotiating(negotiation)?;
+                        if let InnerState::Negotiating(n) = &**self.status.get() {
+                            match n.initiate().await {
+                                Ok(Some(offer)) => {
+                                    let _ = self.signal_sender.send(Signal::Sdp(offer));
+                                }
+                                Ok(None) => {
+                                    // do nothing
+                                }
+                                Err(cause) => {
+                                    let _ = self.status.set_failed(cause);
+                                }
                             }
                         }
                     }
@@ -406,7 +428,7 @@ async fn status_connected(status: &PeerConnectionState) -> Result<(), Error> {
         match s {
             InnerState::Waiting(ready) => ready.notified().await,
             InnerState::Negotiating(negotiation) => negotiation.ready.notified().await,
-            InnerState::Ready => return Ok(()),
+            InnerState::Ready(_) => return Ok(()),
             InnerState::Closed(err) => {
                 return if let Some(e) = err {
                     Err(e.clone())
@@ -434,9 +456,23 @@ impl PeerConnectionDataChannels {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Signal {
-    Renegotiate,
+    #[serde(rename = "renegotiate")]
+    Renegotiate(bool),
+    #[serde(rename = "candidate")]
     Candidate(RTCIceCandidate),
+    #[serde(rename = "sdp")]
     Sdp(RTCSessionDescription),
+}
+
+impl PartialEq for Signal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Signal::Renegotiate(x), Signal::Renegotiate(y)) => x == y,
+            (Signal::Candidate(c1), Signal::Candidate(c2)) => c1 == c2,
+            (Signal::Sdp(s1), Signal::Sdp(s2)) => s1.sdp_type == s2.sdp_type && s1.sdp == s2.sdp,
+            (_, _) => false,
+        }
+    }
 }
 
 #[repr(transparent)]
@@ -484,7 +520,7 @@ impl PeerConnectionState {
         match &*old {
             InnerState::Waiting(ready) => ready.notify_waiters(),
             InnerState::Negotiating(n) => n.ready.notify_waiters(),
-            InnerState::Ready => {}
+            InnerState::Ready(n) => n.notify_waiters(),
             InnerState::Closed(cause) => {
                 if let Some(cause) = cause {
                     return Err(cause.clone());
@@ -505,7 +541,7 @@ impl Default for PeerConnectionState {
 enum InnerState {
     Waiting(Notify),
     Negotiating(Negotiation),
-    Ready,
+    Ready(Notify),
     Closed(Option<Error>),
 }
 
@@ -515,7 +551,7 @@ impl InnerState {
     }
 
     fn ready() -> Arc<Self> {
-        Arc::new(InnerState::Ready)
+        Arc::new(InnerState::Ready(Notify::new()))
     }
 
     fn closed_gracefully() -> Arc<Self> {
@@ -542,10 +578,21 @@ impl InnerState {
 #[cfg(test)]
 mod test {
     use crate::error::Error;
-    use crate::peer_connection::{Options, PeerConnection};
+    use crate::peer_connection::{Options, PeerConnection, Signal};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use futures_util::future::try_join_all;
+    use futures_util::TryFutureExt;
     use tokio::spawn;
     use tokio::task::JoinHandle;
+    use tokio::time::sleep;
+    use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+    use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+    use webrtc::ice_transport::ice_protocol::RTCIceProtocol;
+    use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
+    use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+    use webrtc::sdp::SessionDescription;
 
     fn exchange(
         from: Arc<PeerConnection>,
@@ -553,6 +600,7 @@ mod test {
     ) -> JoinHandle<Result<(), Error>> {
         spawn(async move {
             while let Some(signal) = from.listen().await {
+                println!("{:?}", signal);
                 to.signal(signal).await?;
             }
             Ok(())
@@ -575,5 +623,93 @@ mod test {
         p2.close().await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_closed() -> Result<(), Error> {
+        let options = Options::with_data_channels(&["dc"]);
+        let p1 = Arc::new(PeerConnection::start(true, options.clone()).await?);
+        let p2 = Arc::new(PeerConnection::start(false, options).await?);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let f1 = p1.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(())});
+        let c = counter.clone();
+        let f2 = p1.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(()) });
+        let c = counter.clone();
+        let f3 = p2.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(()) });
+        let c = counter.clone();
+        let f4 = p2.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(()) });
+
+        let _ = exchange(p1.clone(), p2.clone());
+        let _ = exchange(p2.clone(), p1.clone());
+
+        p1.connected().await?;
+        p2.connected().await?;
+
+        p1.close().await?;
+        p2.close().await?;
+
+        f1.await?;
+        f2.await?;
+        f3.await?;
+        f4.await?;
+
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn signal_serialization() {
+        let candidate = RTCIceCandidate {
+            stats_id: "candidate:UcZ4TWueGMPo2CVb89j0JmbGbeEgpDyK".to_string(),
+            foundation: "3299231860".to_string(),
+            priority: 2130706431,
+            address: "192.168.56.1".to_string(),
+            protocol: RTCIceProtocol::Udp,
+            port: 53545,
+            typ: RTCIceCandidateType::Host,
+            component: 1,
+            related_address: "".to_string(),
+            related_port: 0,
+            tcp_type: "unspecified".to_string(),
+        };
+        let sdp = r#"v=0
+o=- 2043488436270048026 560464900 IN IP4 0.0.0.0
+s=-
+t=0 0
+a=fingerprint:sha-256 D8:53:60:55:F5:04:35:D0:30:3A:8A:DC:2B:26:D6:EF:F5:09:67:0B:0E:B3:C5:CA:B0:85:2E:9C:FC:25:57:45
+a=group:BUNDLE 0
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 0.0.0.0
+a=setup:actpass
+a=mid:0
+a=sendrecv
+a=sctp-port:5000
+a=ice-ufrag:aeqnRWKqXnAJjFbZ
+a=ice-pwd:cqzvayDwlWVFBfsBYhDgOiPjsnFnSZMC
+"#;
+        let signals = vec![
+            (
+                Signal::Sdp(RTCSessionDescription::offer(sdp.to_string()).unwrap()),
+                format!(
+                    r#"{{"sdp":{{"type":"offer","sdp":{}}}}}"#,
+                    serde_json::to_string(sdp).unwrap()
+                ),
+            ),
+            (
+                Signal::Candidate(candidate),
+                r#"{"candidate":{"stats_id":"candidate:UcZ4TWueGMPo2CVb89j0JmbGbeEgpDyK","foundation":"3299231860","priority":2130706431,"address":"192.168.56.1","protocol":"udp","port":53545,"typ":"host","component":1,"related_address":"","related_port":0,"tcp_type":"unspecified"}}"#.to_string(),
+            ),
+            (Signal::Renegotiate(true), r#"{"renegotiate":true}"#.to_string()),
+        ];
+        for (signal, expected) in signals {
+            let json = serde_json::to_string(&signal).unwrap();
+            assert_eq!(json, expected);
+
+            let actual: Signal = serde_json::from_str(&json).unwrap();
+            assert_eq!(actual, signal);
+        }
     }
 }
