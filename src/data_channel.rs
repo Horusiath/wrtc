@@ -35,7 +35,6 @@ impl DataChannel {
         let status = Arc::new(ArcSwap::new(DataChannelStreamState::waiting()));
         let s = Arc::downgrade(&status);
         dc.on_open(Box::new(move || {
-            log::info!("data channel has been opened");
             let s = s.clone();
             Box::pin(async move {
                 if let Some(status) = s.upgrade() {
@@ -392,8 +391,8 @@ mod test {
         to: Arc<PeerConnection>,
     ) -> JoinHandle<Result<(), Error>> {
         tokio::spawn(async move {
-            while let Some(signal) = from.listen().await {
-                to.signal(signal).await?;
+            while let Some(signal) = from.signal().await {
+                to.apply_signal(signal).await?;
             }
             Ok(())
         })

@@ -13,14 +13,12 @@ use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
 
 /// WebRTC peer connection with simplified access patterns.
@@ -38,7 +36,7 @@ impl PeerConnection {
     /// Starts a new instance of [PeerConnection].
     ///
     /// In order to exchange necessary data between initiator/acceptor peers, you need to follow
-    /// messages coming from [PeerConnection::listen] on one peer and apply them on another via
+    /// messages coming from [PeerConnection::signal] on one peer and apply them on another via
     /// [PeerConnection::signal].
     ///
     /// Use [PeerConnection::connected] in order to await for connection to be established.
@@ -134,35 +132,6 @@ impl PeerConnection {
         }
         {
             let status = status.weak_ref();
-            peer_connection.on_ice_gathering_state_change(Box::new(move |s| {
-                match s {
-                    RTCIceGathererState::Unspecified => {}
-                    RTCIceGathererState::New => {}
-                    RTCIceGathererState::Gathering => {}
-                    RTCIceGathererState::Complete => {}
-                    RTCIceGathererState::Closed => {}
-                }
-                Box::pin(async move {})
-            }));
-        }
-        {
-            let status = status.weak_ref();
-            let pc = Arc::downgrade(&peer_connection);
-            peer_connection.on_signaling_state_change(Box::new(move |s| {
-                match s {
-                    RTCSignalingState::Unspecified => {}
-                    RTCSignalingState::Stable => {}
-                    RTCSignalingState::HaveLocalOffer => {}
-                    RTCSignalingState::HaveRemoteOffer => {}
-                    RTCSignalingState::HaveLocalPranswer => {}
-                    RTCSignalingState::HaveRemotePranswer => {}
-                    RTCSignalingState::Closed => {}
-                }
-                Box::pin(async move {})
-            }));
-        }
-        {
-            let status = status.weak_ref();
             let pc = Arc::downgrade(&peer_connection);
             let signals = signal_sender.clone();
             peer_connection.on_negotiation_needed(Box::new(move || {
@@ -221,6 +190,11 @@ impl PeerConnection {
         Ok(pc)
     }
 
+    /// Check if current [PeerConnection] is the initiator of the connection.
+    pub fn is_initiator(&self) -> bool {
+        self.initiator
+    }
+
     /// Check if current peer connection is in process of being negotiated with its remote
     /// counterpart.
     pub fn is_negotiating(&self) -> bool {
@@ -264,8 +238,8 @@ impl PeerConnection {
 
     /// Listen to the next [Signal] message coming out of the current [PeerConnection]. This signal
     /// should be serialized, passed over to its remote counterpart and applied there using
-    /// [PeerConnection::signal].
-    pub async fn listen(&self) -> Option<Signal> {
+    /// [PeerConnection::apply_signal].
+    pub async fn signal(&self) -> Option<Signal> {
         if self.status.get().is_closed() {
             None
         } else {
@@ -275,7 +249,7 @@ impl PeerConnection {
     }
 
     /// Apply [Signal]s received from the remote [PeerConnection].
-    pub async fn signal(&self, signal: Signal) -> Result<(), Error> {
+    pub async fn apply_signal(&self, signal: Signal) -> Result<(), Error> {
         match signal {
             Signal::Renegotiate(renegotiate) => {
                 if renegotiate {
@@ -537,6 +511,17 @@ impl Default for PeerConnectionState {
     }
 }
 
+impl std::fmt::Display for PeerConnectionState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &**self.0.load() {
+            InnerState::Waiting(_) => write!(f, "waiting"),
+            InnerState::Negotiating(_) => write!(f, "negotiating"),
+            InnerState::Ready(_) => write!(f, "ready"),
+            InnerState::Closed(_) => write!(f, "closed"),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum InnerState {
     Waiting(Notify),
@@ -579,29 +564,23 @@ impl InnerState {
 mod test {
     use crate::error::Error;
     use crate::peer_connection::{Options, PeerConnection, Signal};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-    use futures_util::future::try_join_all;
     use futures_util::TryFutureExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::spawn;
     use tokio::task::JoinHandle;
-    use tokio::time::sleep;
     use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
     use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
     use webrtc::ice_transport::ice_protocol::RTCIceProtocol;
-    use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-    use webrtc::sdp::SessionDescription;
 
     fn exchange(
         from: Arc<PeerConnection>,
         to: Arc<PeerConnection>,
     ) -> JoinHandle<Result<(), Error>> {
         spawn(async move {
-            while let Some(signal) = from.listen().await {
-                println!("{:?}", signal);
-                to.signal(signal).await?;
+            while let Some(signal) = from.signal().await {
+                to.apply_signal(signal).await?;
             }
             Ok(())
         })
@@ -633,13 +612,25 @@ mod test {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c = counter.clone();
-        let f1 = p1.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(())});
+        let f1 = p1.closed().and_then(move |_| async move {
+            c.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
         let c = counter.clone();
-        let f2 = p1.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(()) });
+        let f2 = p1.closed().and_then(move |_| async move {
+            c.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
         let c = counter.clone();
-        let f3 = p2.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(()) });
+        let f3 = p2.closed().and_then(move |_| async move {
+            c.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
         let c = counter.clone();
-        let f4 = p2.closed().and_then(move |_| async move{ c.fetch_add(1, Ordering::AcqRel); Ok(()) });
+        let f4 = p2.closed().and_then(move |_| async move {
+            c.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
 
         let _ = exchange(p1.clone(), p2.clone());
         let _ = exchange(p2.clone(), p1.clone());
