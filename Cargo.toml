@@ -1,6 +1,6 @@
 [package]
 name = "wrtc"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Wrapper around webrtc-rs library, focused on developer experience"
 license = "MIT"
