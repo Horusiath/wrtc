@@ -1,7 +1,7 @@
 # wrtc
 
 This is a Rust library wrapper around popular [webrtc](https://webrtc.rs/), that's focused on a developer experience.
-API is loosely inspired by NodeJS [simple-peer](https://github.com/feross/simple-peer) library and tries its best to conform to idiomatic Rust structures eg. futures `Sink`/`Stream` instead of callbacks. 
+Message exchange protocol is compatible with NPM [simple-peer](https://github.com/feross/simple-peer) library and tries its best to conform to idiomatic Rust structures eg. futures `Sink`/`Stream` instead of callbacks. 
 
 
 ## API coverage

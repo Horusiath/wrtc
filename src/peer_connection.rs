@@ -1,7 +1,9 @@
 use crate::data_channel::DataChannel;
 use crate::error::Error;
 use arc_swap::{ArcSwap, Guard};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Unexpected, Visitor};
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::{Arc, Weak};
@@ -11,7 +13,7 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -123,7 +125,9 @@ impl PeerConnection {
             let signals = signal_sender.clone();
             peer_connection.on_ice_candidate(Box::new(move |candidate| {
                 if let Some(candidate) = candidate {
-                    let _ = signals.send(Signal::Candidate(candidate));
+                    if let Ok(candidate) = candidate.to_json() {
+                        let _ = signals.send(Signal::Candidate(candidate));
+                    }
                 } else {
                     // ICE complete
                 }
@@ -275,7 +279,6 @@ impl PeerConnection {
             }
             Signal::Candidate(candidate) => {
                 if let Some(_) = self.pc.remote_description().await {
-                    let candidate = candidate.to_json()?;
                     self.pc.add_ice_candidate(candidate).await?;
                 } else if let InnerState::Negotiating(n) = &**self.status.get() {
                     let mut candidates = n.pending_candidates.lock().await;
@@ -292,7 +295,6 @@ impl PeerConnection {
                 if let InnerState::Negotiating(n) = &**self.status.get() {
                     let mut candidates = n.pending_candidates.lock().await;
                     for candidate in candidates.drain(..) {
-                        let candidate = candidate.to_json()?;
                         self.pc.add_ice_candidate(candidate).await?;
                     }
                 }
@@ -338,7 +340,7 @@ impl std::fmt::Debug for PeerConnection {
 struct Negotiation {
     initiator: bool,
     ready: Notify,
-    pending_candidates: Mutex<Vec<RTCIceCandidate>>,
+    pending_candidates: Mutex<Vec<RTCIceCandidateInit>>,
     pc: Weak<RTCPeerConnection>,
 }
 
@@ -428,13 +430,10 @@ impl PeerConnectionDataChannels {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Signal {
-    #[serde(rename = "renegotiate")]
     Renegotiate(bool),
-    #[serde(rename = "candidate")]
-    Candidate(RTCIceCandidate),
-    #[serde(rename = "sdp")]
+    Candidate(RTCIceCandidateInit),
     Sdp(RTCSessionDescription),
 }
 
@@ -446,6 +445,142 @@ impl PartialEq for Signal {
             (Signal::Sdp(s1), Signal::Sdp(s2)) => s1.sdp_type == s2.sdp_type && s1.sdp == s2.sdp,
             (_, _) => false,
         }
+    }
+}
+
+impl Serialize for Signal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut s = serializer.serialize_map(None)?;
+        match self {
+            Signal::Renegotiate(enable) => {
+                s.serialize_entry("renegotiate", enable)?;
+            }
+            Signal::Candidate(candidate) => {
+                s.serialize_entry("candidate", candidate)?;
+            }
+            Signal::Sdp(sdp) => {
+                s.serialize_entry("type", &sdp.sdp_type)?;
+                s.serialize_entry("sdp", &sdp.sdp)?;
+            }
+        }
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Signal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        enum Field {
+            Renegotiate,
+            Candidate,
+            Sdp,
+            Type,
+        }
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                        formatter.write_str("`renegotiate` or `candidate` or `sdp` or `type`")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Field, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "renegotiate" => Ok(Field::Renegotiate),
+                            "candidate" => Ok(Field::Candidate),
+                            "sdp" => Ok(Field::Sdp),
+                            "type" => Ok(Field::Type),
+                            _ => Err(serde::de::Error::unknown_field(
+                                value,
+                                &["renegotiate", "candidate", "sdp", "type"],
+                            )),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct SignalVisitor;
+        impl<'de> Visitor<'de> for SignalVisitor {
+            type Value = Signal;
+
+            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                formatter.write_str("enum Signal")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                if let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Renegotiate => Ok(Signal::Renegotiate(map.next_value()?)),
+                        Field::Candidate => Ok(Signal::Candidate(map.next_value()?)),
+                        Field::Sdp => {
+                            let sdp = map.next_value()?;
+                            if let Some(Field::Type) = map.next_key()? {
+                                let t: &str = map.next_value()?;
+                                let sdp = match t {
+                                    "offer" => RTCSessionDescription::offer(sdp),
+                                    "answer" => RTCSessionDescription::answer(sdp),
+                                    other => {
+                                        return Err(serde::de::Error::invalid_value(
+                                            Unexpected::Str(other),
+                                            &"`offer` or `answer`",
+                                        ))
+                                    }
+                                };
+                                Ok(Signal::Sdp(
+                                    sdp.map_err(|e| serde::de::Error::custom(&e.to_string()))?,
+                                ))
+                            } else {
+                                Err(serde::de::Error::missing_field("type"))
+                            }
+                        }
+                        Field::Type => {
+                            let t = map.next_value()?;
+                            if let Some(Field::Sdp) = map.next_key()? {
+                                let sdp: String = map.next_value()?;
+                                let sdp = match t {
+                                    "offer" => RTCSessionDescription::offer(sdp),
+                                    "answer" => RTCSessionDescription::answer(sdp),
+                                    other => {
+                                        return Err(serde::de::Error::invalid_value(
+                                            Unexpected::Str(other),
+                                            &"`offer` or `answer`",
+                                        ))
+                                    }
+                                };
+                                Ok(Signal::Sdp(
+                                    sdp.map_err(|e| serde::de::Error::custom(&e.to_string()))?,
+                                ))
+                            } else {
+                                Err(serde::de::Error::missing_field("sdp"))
+                            }
+                        }
+                    }
+                } else {
+                    Err(serde::de::Error::custom("Signal cannot be empty"))
+                }
+            }
+        }
+        deserializer.deserialize_map(SignalVisitor)
     }
 }
 
@@ -685,13 +820,13 @@ a=ice-pwd:cqzvayDwlWVFBfsBYhDgOiPjsnFnSZMC
             (
                 Signal::Sdp(RTCSessionDescription::offer(sdp.to_string()).unwrap()),
                 format!(
-                    r#"{{"sdp":{{"type":"offer","sdp":{}}}}}"#,
+                    r#"{{"type":"offer","sdp":{}}}"#,
                     serde_json::to_string(sdp).unwrap()
                 ),
             ),
             (
-                Signal::Candidate(candidate),
-                r#"{"candidate":{"stats_id":"candidate:UcZ4TWueGMPo2CVb89j0JmbGbeEgpDyK","foundation":"3299231860","priority":2130706431,"address":"192.168.56.1","protocol":"udp","port":53545,"typ":"host","component":1,"related_address":"","related_port":0,"tcp_type":"unspecified"}}"#.to_string(),
+                Signal::Candidate(candidate.to_json().unwrap()),
+                r#"{"candidate":{"candidate":"candidate:3299231860 1 udp 2130706431 192.168.56.1 53545 typ host","sdpMid":"","sdpMLineIndex":0,"usernameFragment":null}}"#.to_string(),
             ),
             (Signal::Renegotiate(true), r#"{"renegotiate":true}"#.to_string()),
         ];
