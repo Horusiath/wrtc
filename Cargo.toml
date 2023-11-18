@@ -1,6 +1,6 @@
 [package]
 name = "wrtc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Wrapper around webrtc-rs library, focused on developer experience"
 license = "MIT"
@@ -11,13 +11,13 @@ readme = "./README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-webrtc = "^0.7"
+webrtc = "0.9"
 thiserror = "1.0"
-tokio = { version = "^1.27", features = ["full"] }
+tokio = { version = "1.34", features = ["full"] }
 arc-swap = "1.6"
-bytes = "^1.4"
+bytes = "1.5"
 futures-util = { version = "0.3", features=["sink"] }
-tokio-util = "^0.7"
+tokio-util = "0.7"
 log = "0.4"
 serde = {version = "1.0", features = ["derive"] }
 

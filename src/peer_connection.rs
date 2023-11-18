@@ -2,7 +2,7 @@ use crate::data_channel::DataChannel;
 use crate::error::Error;
 use arc_swap::{ArcSwap, Guard};
 use serde::de::{MapAccess, Unexpected, Visitor};
-use serde::ser::{SerializeMap, SerializeStruct};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::Formatter;
@@ -13,7 +13,7 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -25,6 +25,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 /// WebRTC peer connection with simplified access patterns.
 pub struct PeerConnection {
+    #[allow(dead_code)]
     api: API,
     pc: Arc<RTCPeerConnection>,
     status: PeerConnectionState,
@@ -145,7 +146,7 @@ impl PeerConnection {
                 let signals = signals.clone();
                 Box::pin(async move {
                     if let Some(status) = PeerConnectionState::upgrade(&status) {
-                        let negotiation = Negotiation::new(pc, initiator);
+                        let negotiation = Negotiation::new(pc);
                         if status.set_negotiating(negotiation).is_ok() {
                             if let InnerState::Negotiating(n) = &**status.get() {
                                 match n.initiate().await {
@@ -258,8 +259,7 @@ impl PeerConnection {
             Signal::Renegotiate(renegotiate) => {
                 if renegotiate {
                     if !self.status.get().is_closed() && self.initiator {
-                        let negotiation =
-                            Negotiation::new(Arc::downgrade(&self.pc), self.initiator);
+                        let negotiation = Negotiation::new(Arc::downgrade(&self.pc));
                         self.status.set_negotiating(negotiation)?;
                         if let InnerState::Negotiating(n) = &**self.status.get() {
                             match n.initiate().await {
@@ -338,7 +338,6 @@ impl std::fmt::Debug for PeerConnection {
 
 #[derive(Debug)]
 struct Negotiation {
-    initiator: bool,
     ready: Notify,
     pending_candidates: Mutex<Vec<RTCIceCandidateInit>>,
     pc: Weak<RTCPeerConnection>,
@@ -357,10 +356,9 @@ impl Negotiation {
 }
 
 impl Negotiation {
-    fn new(pc: Weak<RTCPeerConnection>, initiator: bool) -> Self {
+    fn new(pc: Weak<RTCPeerConnection>) -> Self {
         Negotiation {
             pc,
-            initiator,
             ready: Notify::new(),
             pending_candidates: Mutex::new(Vec::new()),
         }

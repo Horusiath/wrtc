@@ -13,6 +13,8 @@ use tokio_util::sync::ReusableBoxFuture;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 
+/// Representation of WebRTC data channel. It implements [futures_util::Stream] trait, which makes
+/// it easier to operate on in Rust context.
 pub struct DataChannel {
     dc: Arc<RTCDataChannel>,
     status: Arc<ArcSwap<DataChannelStreamState>>,
@@ -353,6 +355,8 @@ impl DataChannelStreamState {
         })
     }
 
+    /// If true, current data channel hasn't been opened yet.
+    #[allow(dead_code)]
     pub fn is_waiting(&self) -> bool {
         if let DataChannelStreamState::Waiting { .. } = self {
             true
@@ -361,6 +365,7 @@ impl DataChannelStreamState {
         }
     }
 
+    /// If true, current data channel is open and ready to serve messages.
     pub fn is_open(&self) -> bool {
         match self {
             DataChannelStreamState::Open { .. } => true,
@@ -368,6 +373,7 @@ impl DataChannelStreamState {
         }
     }
 
+    /// If true, current data channel has already been closed and won't serve any more messages.
     pub fn is_closed(&self) -> bool {
         if let DataChannelStreamState::Closed { .. } = self {
             true
